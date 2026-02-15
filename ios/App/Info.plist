@@ -22,8 +22,6 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Zypper Voice uses the microphone to capture your speech for dictation.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Zypper Voice uses speech recognition to transcribe what you say into text.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

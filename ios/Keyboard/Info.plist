@@ -40,7 +40,15 @@
 	</dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Zypper Voice keyboard uses the microphone to capture speech dictation.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Zypper Voice keyboard uses speech recognition to transcribe speech into text.</string>
+	<key>ZypperOpenAIAPIKey</key>
+	<string>YOUR_OPENAI_API_KEY</string>
+	<key>ZypperOpenAIBaseURL</key>
+	<string>https://api.openai.com/v1</string>
+	<key>ZypperOpenAILanguage</key>
+	<string></string>
+	<key>ZypperOpenAIModel</key>
+	<string>gpt-4o-mini-transcribe</string>
+	<key>ZypperOpenAIPrompt</key>
+	<string></string>
 </dict>
 </plist>

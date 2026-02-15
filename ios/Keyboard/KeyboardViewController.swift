@@ -1,5 +1,4 @@
 import AVFoundation
-import Speech
 import UIKit
 
 final class KeyboardViewController: UIInputViewController {
@@ -16,14 +15,11 @@ final class KeyboardViewController: UIInputViewController {
     private let spaceButton = UIButton(type: .system)
     private let returnButton = UIButton(type: .system)
 
-    private let audioEngine = AVAudioEngine()
-    private var speechRecognizer: SFSpeechRecognizer?
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
-    private var hasInputTap = false
-    private var finalizeFallbackWorkItem: DispatchWorkItem?
+    private var audioRecorder: AVAudioRecorder?
+    private var recordingURL: URL?
+    private var transcriptionTask: Task<Void, Never>?
+    private var idleStatusMessage = "Tap mic to dictate"
 
-    private var renderedTranscript = ""
     private var dictationState: DictationState = .idle {
         didSet {
             updateMicAppearance()
@@ -42,7 +38,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     deinit {
-        cleanupRecognitionSession(cancelTask: true)
+        cleanupSession()
     }
 
     private func buildUI() {
@@ -51,7 +47,7 @@ final class KeyboardViewController: UIInputViewController {
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
         statusLabel.textColor = .secondaryLabel
-        statusLabel.text = "Tap mic to dictate"
+        statusLabel.text = idleStatusMessage
 
         configureKey(nextKeyboardButton, title: "globe", selector: #selector(handleNextKeyboard))
         configureKey(micButton, title: "mic", selector: #selector(handleMicToggle))
@@ -112,7 +108,7 @@ final class KeyboardViewController: UIInputViewController {
         case .idle:
             micButton.backgroundColor = .white
             micButton.tintColor = .label
-            statusLabel.text = "Tap mic to dictate"
+            statusLabel.text = idleStatusMessage
         case .recording:
             micButton.backgroundColor = .systemRed
             micButton.tintColor = .white
@@ -120,7 +116,14 @@ final class KeyboardViewController: UIInputViewController {
         case .transcribing:
             micButton.backgroundColor = .systemOrange
             micButton.tintColor = .white
-            statusLabel.text = "Transcribing..."
+            statusLabel.text = "Transcribing with OpenAI..."
+        }
+    }
+
+    private func setIdleStatus(_ message: String) {
+        idleStatusMessage = message
+        if dictationState == .idle {
+            statusLabel.text = message
         }
     }
 
@@ -144,47 +147,28 @@ final class KeyboardViewController: UIInputViewController {
         switch dictationState {
         case .idle:
             Task { [weak self] in
-                await self?.requestPermissionsAndStart()
+                await self?.requestMicrophoneAndStart()
             }
         case .recording:
-            stopRecording()
+            stopRecordingAndTranscribe()
         case .transcribing:
-            // Ignore tap while finalizing to avoid corrupting active transcript updates.
             break
         }
     }
 
     @MainActor
-    private func requestPermissionsAndStart() async {
-        let speechStatus = await requestSpeechAuthorizationIfNeeded()
-        guard speechStatus == .authorized else {
-            statusLabel.text = "Speech permission denied"
-            return
-        }
-
+    private func requestMicrophoneAndStart() async {
         let micAllowed = await requestMicrophoneAuthorizationIfNeeded()
         guard micAllowed else {
-            statusLabel.text = "Microphone permission denied"
+            setIdleStatus("Microphone permission denied")
             return
         }
 
         do {
             try startRecording()
         } catch {
-            statusLabel.text = "Could not start recording"
-        }
-    }
-
-    private func requestSpeechAuthorizationIfNeeded() async -> SFSpeechRecognizerAuthorizationStatus {
-        let current = SFSpeechRecognizer.authorizationStatus()
-        if current != .notDetermined {
-            return current
-        }
-
-        return await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status)
-            }
+            setIdleStatus("Could not start recording")
+            dictationState = .idle
         }
     }
 
@@ -206,152 +190,113 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func startRecording() throws {
-        cleanupRecognitionSession(cancelTask: true)
-        renderedTranscript = ""
-
-        let languageCode = textInputMode?.primaryLanguage ?? Locale.preferredLanguages.first ?? "en-US"
-        let locale = Locale(identifier: languageCode)
-        speechRecognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
-
-        guard let speechRecognizer, speechRecognizer.isAvailable else {
-            throw DictationError.speechUnavailable
-        }
-
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        if speechRecognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
-
-        recognitionRequest = request
+        cleanupSession()
 
         let audioSession = AVAudioSession.sharedInstance()
         try audioSession.setCategory(.record, mode: .measurement, options: [.duckOthers])
         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
 
-        let inputNode = audioEngine.inputNode
-        removeInputTapIfNeeded()
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.recognitionRequest?.append(buffer)
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zypper-dictation-\(UUID().uuidString)")
+            .appendingPathExtension("m4a")
+
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 16_000,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
+        ]
+
+        let recorder = try AVAudioRecorder(url: tempURL, settings: settings)
+        recorder.prepareToRecord()
+        guard recorder.record() else {
+            throw DictationError.recordingUnavailable
         }
-        hasInputTap = true
 
-        audioEngine.prepare()
-        try audioEngine.start()
-
+        audioRecorder = recorder
+        recordingURL = tempURL
+        setIdleStatus("Tap mic to dictate")
         dictationState = .recording
-
-        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
-            guard let self else { return }
-
-            if let result {
-                DispatchQueue.main.async {
-                    self.renderTranscript(result.bestTranscription.formattedString)
-                    if result.isFinal {
-                        self.finishRecognitionSession()
-                    }
-                }
-            }
-
-            if error != nil {
-                DispatchQueue.main.async {
-                    self.finishRecognitionSession()
-                }
-            }
-        }
     }
 
-    private func stopRecording() {
+    private func stopRecordingAndTranscribe() {
         guard dictationState == .recording else { return }
-        dictationState = .transcribing
-
-        audioEngine.stop()
-        removeInputTapIfNeeded()
-        recognitionRequest?.endAudio()
-
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self, self.dictationState == .transcribing else { return }
-            self.finishRecognitionSession()
-        }
-        finalizeFallbackWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: workItem)
-    }
-
-    private func renderTranscript(_ rawText: String) {
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        applyTranscriptDelta(from: renderedTranscript, to: text)
-        renderedTranscript = text
-    }
-
-    private func applyTranscriptDelta(from oldText: String, to newText: String) {
-        if oldText == newText {
+        guard let recorder = audioRecorder, let fileURL = recordingURL else {
+            setIdleStatus("No active recording")
+            dictationState = .idle
             return
         }
 
-        let oldChars = Array(oldText)
-        let newChars = Array(newText)
+        dictationState = .transcribing
+        recorder.stop()
+        audioRecorder = nil
+        deactivateAudioSession()
 
-        var prefixLength = 0
-        while prefixLength < oldChars.count,
-              prefixLength < newChars.count,
-              oldChars[prefixLength] == newChars[prefixLength] {
-            prefixLength += 1
+        transcriptionTask?.cancel()
+        transcriptionTask = Task { [weak self] in
+            await self?.transcribeAndInsert(fileURL: fileURL)
+        }
+    }
+
+    @MainActor
+    private func transcribeAndInsert(fileURL: URL) async {
+        defer {
+            transcriptionTask = nil
+            try? FileManager.default.removeItem(at: fileURL)
+            recordingURL = nil
+            dictationState = .idle
         }
 
-        let deleteCount = oldChars.count - prefixLength
-        if deleteCount > 0 {
-            for _ in 0..<deleteCount {
-                textDocumentProxy.deleteBackward()
+        do {
+            let config = try OpenAIKeyboardConfig.load()
+            let rawTranscript = try await OpenAITranscriber.transcribe(fileURL: fileURL, config: config)
+
+            if Task.isCancelled {
+                setIdleStatus("Canceled")
+                return
             }
-        }
 
-        if prefixLength < newChars.count {
-            let suffix = String(newChars[prefixLength...])
-            textDocumentProxy.insertText(suffix)
+            let transcript = TranscriptPostProcessor.apply(rawTranscript, language: config.language)
+            guard !transcript.isEmpty else {
+                setIdleStatus("Empty transcript")
+                return
+            }
+
+            textDocumentProxy.insertText(transcript)
+            setIdleStatus("Inserted. Tap mic to dictate")
+        } catch let error as OpenAIKeyboardConfigError {
+            setIdleStatus(error.localizedDescription)
+        } catch {
+            setIdleStatus("Transcription failed")
         }
     }
 
-    private func finishRecognitionSession() {
-        finalizeFallbackWorkItem?.cancel()
-        finalizeFallbackWorkItem = nil
-        cleanupRecognitionSession(cancelTask: false)
-        dictationState = .idle
-        renderedTranscript = ""
+    private func cleanupSession() {
+        transcriptionTask?.cancel()
+        transcriptionTask = nil
+
+        if audioRecorder?.isRecording == true {
+            audioRecorder?.stop()
+        }
+        audioRecorder = nil
+
+        if let recordingURL {
+            try? FileManager.default.removeItem(at: recordingURL)
+            self.recordingURL = nil
+        }
+
+        deactivateAudioSession()
     }
 
-    private func cleanupRecognitionSession(cancelTask: Bool) {
-        finalizeFallbackWorkItem?.cancel()
-        finalizeFallbackWorkItem = nil
-
-        if audioEngine.isRunning {
-            audioEngine.stop()
-        }
-        removeInputTapIfNeeded()
-
-        recognitionRequest?.endAudio()
-        recognitionRequest = nil
-
-        if cancelTask {
-            recognitionTask?.cancel()
-        }
-        recognitionTask = nil
-        speechRecognizer = nil
-
+    private func deactivateAudioSession() {
         do {
             try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         } catch {
-            // Ignore audio-session cleanup failures in keyboard extension.
+            // Ignore cleanup errors in keyboard extension.
         }
-    }
-
-    private func removeInputTapIfNeeded() {
-        guard hasInputTap else { return }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        hasInputTap = false
     }
 }
 
 private enum DictationError: Error {
-    case speechUnavailable
+    case recordingUnavailable
 }
