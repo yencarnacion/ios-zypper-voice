@@ -1,0 +1,50 @@
+name: IOSZypperVoice
+
+options:
+  minimumXcodeGenVersion: 2.38.0
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: 5.0
+    TARGETED_DEVICE_FAMILY: 1,2
+
+targets:
+  ZypperVoice:
+    type: application
+    platform: iOS
+    sources:
+      - path: ios/App
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yamir.zyppervoice
+        INFOPLIST_FILE: ios/App/Info.plist
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        PRODUCT_NAME: ZypperVoice
+        CODE_SIGN_ENTITLEMENTS: ios/App/ZypperVoice.entitlements
+    dependencies:
+      - target: ZypperVoiceKeyboard
+        embed: true
+      - sdk: Speech.framework
+      - sdk: AVFoundation.framework
+
+  ZypperVoiceKeyboard:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ios/Keyboard
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yamir.zyppervoice.keyboard
+        INFOPLIST_FILE: ios/Keyboard/Info.plist
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        PRODUCT_NAME: ZypperVoiceKeyboard
+        APPLICATION_EXTENSION_API_ONLY: YES
+        CODE_SIGN_ENTITLEMENTS: ios/Keyboard/ZypperVoiceKeyboard.entitlements
+    dependencies:
+      - sdk: Speech.framework
+      - sdk: AVFoundation.framework
